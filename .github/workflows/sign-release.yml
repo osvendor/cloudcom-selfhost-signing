@@ -248,7 +248,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           go install github.com/tc-hib/go-winres@v0.3.3
-          export PATH="$(go env GOPATH)/bin:$PATH"
+          go_bin="$(go env GOPATH)/bin"
+          export PATH="$go_bin:$PATH"
           cd breeze/agent/resources
           go-winres simply --arch amd64 --no-suffix --icon icon.ico --admin \
             --file-version "$VERSION" --product-version "$VERSION" \
