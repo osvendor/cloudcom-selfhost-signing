@@ -68,11 +68,35 @@ release), so fleet trust is unchanged.
    AGENT_AUTO_PROMOTE=false   # recommended for first adoption; promote explicitly
    ```
 
+### CloudCom Windows fork build
+
+The ordinary workflow inputs sign unmodified official Breeze artifacts. To
+build the CloudCom JIT PAM agent, supply `cloudcom-source-commit` with the exact
+merged `osvendor/cloudcom` commit, `upstream-version` with its stable official
+Breeze baseline, and a new numeric `version` greater than the installed agent.
+Choose `platforms: windows`. The workflow verifies that the fork commit is on
+`main` and passed push-triggered CloudCom CI, then builds the four Windows
+executables and MSI from that commit.
+
+Follow the `signing` environment and required-reviewer guidance above. Run
+`dry-run: true` first: it publishes no release, leaves the binaries unsigned,
+and signs the downloadable test manifest with a throwaway key. A real run
+requires the Windows code-signing secrets and the release-manifest signing
+secret below. It verifies Authenticode and RFC 3161 timestamps before publishing.
+
+This CloudCom release contains Windows assets only. Do **not** repoint the
+production `BINARY_GITHUB_REPOSITORY` at it or promote it globally until
+Breeze has a platform-scoped source: Linux/macOS downloads would otherwise
+point at a release with no corresponding agents. Keep the OS-TEST canary
+isolated until that rollout path and a signed Windows install are verified.
+
 ## Workflow inputs
 
 | Input | Values | Notes |
 |---|---|---|
-| `version` | `X.Y.Z` or `X.Y.Z-suffix` (no leading `v`) | Must be an official Breeze release that publishes unsigned signing inputs. The run refuses to overwrite an existing `v<version>` release here. |
+| `version` | `X.Y.Z` or `X.Y.Z-suffix` (no leading `v`) | Must be an official Breeze release with unsigned signing inputs, or an unused CloudCom Windows fork version. The run refuses to overwrite an existing `v<version>` release here. |
+| `cloudcom-source-commit` | Exact 40-character SHA | Optional; switches the Windows job to a tested commit on `osvendor/cloudcom` main. Requires `upstream-version` and `platforms: windows`. |
+| `upstream-version` | Official stable `X.Y.Z` | Required with `cloudcom-source-commit`; its official manifest is verified as the baseline. |
 | `signing-mode` | `azure-artifact-signing` (default), `pfx` | PFX is **legacy / internal-PKI only** — publicly trusted code-signing keys must live in HSMs (CA/B Forum, June 2023), so exportable PFX files are generally unavailable for new OV certs. |
 | `platforms` | `all` (default), `windows`, `macos` | Skip a platform **only if your fleet has no such devices** — a skipped platform's assets are absent from your release and those downloads will 404. A partial run also **consumes the version**: the release now exists, so a later run for the same version is refused and you would have to delete the release in the GitHub UI to add the other platform. |
 | `dry-run` | `false` (default), `true` | Download + verify + build with signing stubbed; no secrets or certs needed. Publishes nothing — assets land as the `dry-run-unsigned-assets` workflow artifact. Your manifest key is **never** used: the manifest is signed with a throwaway key generated in-run, and every asset is recorded `platformTrust: none`, so a dry-run bundle cannot be mistaken for a release. |

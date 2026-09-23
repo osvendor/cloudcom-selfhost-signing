@@ -21,6 +21,14 @@ on:
         description: 'Breeze release version to sign (X.Y.Z or X.Y.Z-suffix, no leading v)'
         required: true
         type: string
+      cloudcom-source-commit:
+        description: 'Exact merged CloudCom commit for a Windows-only fork release (leave empty for an official Breeze release)'
+        required: false
+        type: string
+      upstream-version:
+        description: 'Official Breeze version used as the verified baseline for a CloudCom release'
+        required: false
+        type: string
       signing-mode:
         description: 'Windows signing backend (pfx is legacy/internal-PKI only)'
         required: true
@@ -47,6 +55,12 @@ on:
     inputs:
       version:
         required: true
+        type: string
+      cloudcom-source-commit:
+        required: false
+        type: string
+      upstream-version:
+        required: false
         type: string
       signing-mode:
         required: false
@@ -106,6 +120,29 @@ jobs:
           esac
           echo "inputs ok: platforms=$PLATFORMS signing-mode=$SIGNING_MODE"
 
+      - name: Validate CloudCom source and release scope
+        if: inputs.cloudcom-source-commit != '' || inputs.upstream-version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit }}
+          UPSTREAM_VERSION: ${{ inputs.upstream-version }}
+          VERSION: ${{ inputs.version }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::cloudcom-source-commit must be an exact 40-character lowercase SHA'; exit 1; }
+          [[ "$UPSTREAM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::upstream-version must be an official stable X.Y.Z release'; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::CloudCom version must be numeric X.Y.Z for Windows resources and MSI'; exit 1; }
+          if ! python3 -c 'import os; from sys import exit; exit(tuple(map(int, os.environ["VERSION"].split("."))) <= tuple(map(int, os.environ["UPSTREAM_VERSION"].split("."))))'; then
+            echo '::error::CloudCom version must be greater than the upstream baseline'
+            exit 1
+          fi
+          [[ "$PLATFORMS" == windows ]] || { echo '::error::CloudCom fork builds are Windows-only until the other platforms have their own signed release pipeline'; exit 1; }
+          comparison="$(gh api "repos/osvendor/cloudcom/compare/${SOURCE_COMMIT}...main" --jq .status)"
+          [[ "$comparison" == ahead || "$comparison" == identical ]] || { echo '::error::source commit is not an ancestor of CloudCom main'; exit 1; }
+          passed="$(gh api "repos/osvendor/cloudcom/actions/workflows/cloudcom-ci.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&per_page=20" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+          [[ "$passed" -gt 0 ]] || { echo '::error::source commit has no successful push-triggered CloudCom CI run'; exit 1; }
+
       - name: Refuse to overwrite an existing release
         if: inputs.dry-run == false
         env:
@@ -157,9 +194,10 @@ jobs:
         id: verify
         uses: ./.github/actions/verify-official-release
         with:
-          version: ${{ needs.validate.outputs.version }}
+          version: ${{ inputs.upstream-version || needs.validate.outputs.version }}
 
       - name: Checkout Breeze source at manifest sourceCommit
+        if: inputs.cloudcom-source-commit == ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: lanternops/breeze
@@ -167,7 +205,76 @@ jobs:
           path: breeze
           persist-credentials: false
 
+      - name: Checkout tested CloudCom source
+        if: inputs.cloudcom-source-commit != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: osvendor/cloudcom
+          ref: ${{ inputs.cloudcom-source-commit }}
+          path: breeze
+          persist-credentials: false
+
+      - name: Set up Go for CloudCom
+        if: inputs.cloudcom-source-commit != ''
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6
+        with:
+          go-version-file: breeze/agent/go.mod
+          cache-dependency-path: breeze/agent/go.sum
+
+      - name: Verify CloudCom baseline matches the signed official release
+        if: inputs.cloudcom-source-commit != ''
+        env:
+          UPSTREAM_VERSION: ${{ inputs.upstream-version }}
+          VERIFIED_UPSTREAM_COMMIT: ${{ steps.verify.outputs.source-commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const baseline = JSON.parse(fs.readFileSync('breeze/.github/cloudcom-baseline.json', 'utf8'));
+          if (baseline.repository.toLowerCase() !== 'lanternops/breeze' ||
+              baseline.tag !== `v${process.env.UPSTREAM_VERSION}` ||
+              baseline.commit !== process.env.VERIFIED_UPSTREAM_COMMIT) {
+            throw new Error('CloudCom baseline does not match the verified official release');
+          }
+          NODE
+
+      - name: Build CloudCom Windows signing inputs
+        if: inputs.cloudcom-source-commit != ''
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go install github.com/tc-hib/go-winres@v0.3.3
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          cd breeze/agent/resources
+          go-winres simply --arch amd64 --no-suffix --icon icon.ico --admin \
+            --file-version "$VERSION" --product-version "$VERSION" \
+            --product-name 'Breeze RMM Agent' --file-description 'Breeze RMM Agent' \
+            --copyright 'Copyright (c) Breeze RMM' --original-filename breeze-agent.exe \
+            --out ../cmd/breeze-agent/rsrc_windows_amd64.syso
+          for item in 'backup:Breeze RMM Backup Helper:breeze-backup.exe' 'watchdog:Breeze RMM Watchdog:breeze-watchdog.exe' 'user-helper:Breeze RMM User Helper:breeze-user-helper.exe'; do
+            IFS=: read -r component description filename <<< "$item"
+            go-winres simply --arch amd64 --no-suffix --icon icon.ico \
+              --file-version "$VERSION" --product-version "$VERSION" \
+              --product-name "$description" --file-description "$description" \
+              --copyright 'Copyright (c) Breeze RMM' --original-filename "$filename" \
+              --out "../cmd/breeze-$component/rsrc_windows_amd64.syso"
+          done
+          cd ../../..
+          for component in agent backup watchdog user-helper; do
+            flags=()
+            if [[ "$component" == user-helper ]]; then flags+=(--windowsgui); fi
+            bash breeze/agent/scripts/build-edition.sh --edition self-host \
+              --component "$component" --goos windows --goarch amd64 \
+              --version "$VERSION" --out "../../dist/breeze-$component-windows-amd64.exe" \
+              "${flags[@]}"
+          done
+
       - name: Download and verify unsigned signing inputs
+        if: inputs.cloudcom-source-commit == ''
         shell: bash
         env:
           VERSION: ${{ needs.validate.outputs.version }}
@@ -852,7 +959,7 @@ jobs:
         id: verify
         uses: ./.github/actions/verify-official-release
         with:
-          version: ${{ needs.validate.outputs.version }}
+          version: ${{ inputs.upstream-version || needs.validate.outputs.version }}
 
       - name: Download signed Windows artifacts
         if: needs.windows.result == 'success'
@@ -883,6 +990,7 @@ jobs:
           path: attest/
 
       - name: Mirror never-signed official assets (verified)
+        if: inputs.cloudcom-source-commit == ''
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           OFFICIAL_MANIFEST_PATH: ${{ steps.verify.outputs.manifest-path }}
@@ -922,7 +1030,7 @@ jobs:
       - name: Generate release artifact manifest
         env:
           SIGN_VERSION: ${{ needs.validate.outputs.version }}
-          SOURCE_COMMIT: ${{ steps.verify.outputs.source-commit }}
+          SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit || steps.verify.outputs.source-commit }}
           OFFICIAL_MANIFEST_PATH: ${{ steps.verify.outputs.manifest-path }}
           DRY_RUN: ${{ inputs.dry-run }}
           WINDOWS_RAN: ${{ needs.windows.result == 'success' }}
@@ -992,11 +1100,11 @@ jobs:
           official_trust = {
               a["name"]: a.get("platformTrust") for a in official.get("assets", [])
           }
+          mirrored_path = attest_dir / "mirrored.txt"
           mirrored = [
-              line
-              for line in (attest_dir / "mirrored.txt").read_text(encoding="utf8").splitlines()
+              line for line in mirrored_path.read_text(encoding="utf8").splitlines()
               if line.strip()
-          ]
+          ] if mirrored_path.is_file() else []
 
           # Completeness. `actions/upload-artifact` defaults to warning rather
           # than failing on an empty match, so without this a path that stopped
@@ -1194,6 +1302,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.validate.outputs.version }}
+          CLOUDCOM_SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit }}
         run: |
           set -euo pipefail
           # Re-check immediately before create: a concurrent run may have
@@ -1215,15 +1324,21 @@ jobs:
               exit 1
               ;;
           esac
+          if [ -n "$CLOUDCOM_SOURCE_COMMIT" ]; then
+            title="CloudCom ${VERSION} (Windows self-host)"
+            notes="Windows-only CloudCom agent packages built from osvendor/cloudcom commit ${CLOUDCOM_SOURCE_COMMIT} and signed with this organization's certificates. Do not point all-platform Breeze binary downloads at this partial release."
+          else
+            title="Breeze ${VERSION} (self-signed)"
+            notes="Breeze ${VERSION} agent packages signed with this organization's certificates. Built from official unsigned artifacts of https://github.com/lanternops/breeze/releases/tag/v${VERSION}, verified against the official Ed25519 release manifest before signing."
+          fi
           gh release create "v${VERSION}" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Breeze ${VERSION} (self-signed)" \
-            --notes "Breeze ${VERSION} agent packages signed with this organization's certificates. Built from official unsigned artifacts of https://github.com/lanternops/breeze/releases/tag/v${VERSION}, verified against the official Ed25519 release manifest before signing."
+            --repo "$GITHUB_REPOSITORY" --title "$title" --notes "$notes"
 
       - name: Write instance configuration summary
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           DRY_RUN: ${{ inputs.dry-run }}
+          CLOUDCOM_SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit }}
         run: |
           set -euo pipefail
           pubkey="$(cat derived-public-key.txt)"
@@ -1234,6 +1349,10 @@ jobs:
               echo "> **Dry run** — nothing was published. The binaries produced are **unsigned** and the key below is a throwaway generated in this run: your real manifest key was never loaded, so the \`dry-run-unsigned-assets\` artifact cannot be used as a release. Real runs print your real key here."
               echo ""
             fi
+            if [ -n "$CLOUDCOM_SOURCE_COMMIT" ]; then
+              echo "> **Windows-only CloudCom release.** Keep the production BINARY_GITHUB_REPOSITORY and fleet promotion unchanged until a platform-scoped download source and signed canary rollout are verified. This workflow does not publish Linux/macOS agents."
+              echo ""
+            else
             echo '```bash'
             echo "BINARY_SOURCE=github"
             echo "BINARY_GITHUB_REPOSITORY=${GITHUB_REPOSITORY}"
@@ -1243,4 +1362,5 @@ jobs:
             echo '```'
             echo ""
             echo "Map each variable in your compose file's \`api\` service \`environment:\` block — a value in \`.env\` alone never reaches the container. Full walkthrough: the \"Sign Your Own Agent Packages\" guide in the Breeze docs."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
