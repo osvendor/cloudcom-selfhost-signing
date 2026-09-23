@@ -51,6 +51,11 @@ on:
         required: true
         default: false
         type: boolean
+      publish-unsigned:
+        description: 'Explicit Windows-only CloudCom unsigned self-host prerelease (requires manifest key; never a signed-agent release)'
+        required: true
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       version:
@@ -71,6 +76,10 @@ on:
         default: all
         type: string
       dry-run:
+        required: false
+        default: false
+        type: boolean
+      publish-unsigned:
         required: false
         default: false
         type: boolean
@@ -142,6 +151,19 @@ jobs:
           [[ "$comparison" == ahead || "$comparison" == identical ]] || { echo '::error::source commit is not an ancestor of CloudCom main'; exit 1; }
           passed="$(gh api "repos/osvendor/cloudcom/actions/workflows/cloudcom-ci.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&per_page=20" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
           [[ "$passed" -gt 0 ]] || { echo '::error::source commit has no successful push-triggered CloudCom CI run'; exit 1; }
+
+      - name: Validate explicit unsigned publication
+        if: inputs.publish-unsigned == true
+        env:
+          SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit }}
+          PLATFORMS: ${{ inputs.platforms }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SOURCE_COMMIT" && "$PLATFORMS" == windows && "$DRY_RUN" == false ]] || {
+            echo '::error::publish-unsigned requires a CloudCom source commit, platforms=windows, and dry-run=false'
+            exit 1
+          }
 
       - name: Refuse to overwrite an existing release
         if: inputs.dry-run == false
@@ -310,7 +332,7 @@ jobs:
           wix eula accept wix7
 
       - name: Validate Azure signing secrets
-        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false
+        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false && inputs.publish-unsigned == false
         shell: pwsh
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -327,7 +349,7 @@ jobs:
           }
 
       - name: Validate PFX signing secrets
-        if: inputs.signing-mode == 'pfx' && inputs.dry-run == false
+        if: inputs.signing-mode == 'pfx' && inputs.dry-run == false && inputs.publish-unsigned == false
         shell: pwsh
         env:
           WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
@@ -340,7 +362,7 @@ jobs:
           }
 
       - name: Azure Login (OIDC)
-        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false
+        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false && inputs.publish-unsigned == false
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -348,7 +370,7 @@ jobs:
           allow-no-subscriptions: true
 
       - name: Sign agent EXE (Azure Artifact Signing)
-        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false
+        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false && inputs.publish-unsigned == false
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
@@ -360,7 +382,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Sign backup EXE (Azure Artifact Signing)
-        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false
+        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false && inputs.publish-unsigned == false
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
@@ -372,7 +394,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Sign watchdog EXE (Azure Artifact Signing)
-        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false
+        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false && inputs.publish-unsigned == false
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
@@ -384,7 +406,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Sign user-helper EXE (Azure Artifact Signing)
-        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false
+        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false && inputs.publish-unsigned == false
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
@@ -396,7 +418,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Sign EXEs (PFX — legacy/internal PKI)
-        if: inputs.signing-mode == 'pfx' && inputs.dry-run == false
+        if: inputs.signing-mode == 'pfx' && inputs.dry-run == false && inputs.publish-unsigned == false
         shell: pwsh
         env:
           WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
@@ -470,7 +492,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "build-msi.ps1 failed with exit code $LASTEXITCODE" }
 
       - name: Sign MSI (Azure Artifact Signing)
-        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false
+        if: inputs.signing-mode == 'azure-artifact-signing' && inputs.dry-run == false && inputs.publish-unsigned == false
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
@@ -482,7 +504,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Sign MSI (PFX — legacy/internal PKI)
-        if: inputs.signing-mode == 'pfx' && inputs.dry-run == false
+        if: inputs.signing-mode == 'pfx' && inputs.dry-run == false && inputs.publish-unsigned == false
         shell: pwsh
         env:
           WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
@@ -512,9 +534,11 @@ jobs:
         shell: pwsh
         env:
           DRY_RUN: ${{ inputs.dry-run }}
+          PUBLISH_UNSIGNED: ${{ inputs.publish-unsigned }}
         run: |
           $ErrorActionPreference = "Stop"
           $dryRun = $env:DRY_RUN -eq "true"
+          $publishUnsigned = $env:PUBLISH_UNSIGNED -eq "true"
           $expected = @(
             "breeze-agent-windows-amd64.exe",
             "breeze-backup-windows-amd64.exe",
@@ -546,6 +570,11 @@ jobs:
             if ($dryRun) {
               $lines += "$name`tunsigned-dry-run"
               Write-Host "dry-run output ok (unsigned): $name"
+              continue
+            }
+            if ($publishUnsigned) {
+              $lines += "$name`tunsigned-self-host"
+              Write-Host "explicit unsigned self-host prerelease: $name"
               continue
             }
             $sig = Get-AuthenticodeSignature -FilePath $path
@@ -1034,6 +1063,7 @@ jobs:
           SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit || steps.verify.outputs.source-commit }}
           OFFICIAL_MANIFEST_PATH: ${{ steps.verify.outputs.manifest-path }}
           DRY_RUN: ${{ inputs.dry-run }}
+          PUBLISH_UNSIGNED: ${{ inputs.publish-unsigned }}
           WINDOWS_RAN: ${{ needs.windows.result == 'success' }}
           MACOS_RAN: ${{ needs.macos.result == 'success' }}
         run: |
@@ -1046,6 +1076,7 @@ jobs:
           release_dir = Path("release-assets")
           attest_dir = Path("attest")
           dry_run = os.environ["DRY_RUN"] == "true"
+          publish_unsigned = os.environ["PUBLISH_UNSIGNED"] == "true"
           windows_ran = os.environ["WINDOWS_RAN"] == "true"
           macos_ran = os.environ["MACOS_RAN"] == "true"
 
@@ -1096,6 +1127,12 @@ jobs:
               raise SystemExit(
                   "real run produced an unsigned-dry-run attestation — refusing to publish"
               )
+          if publish_unsigned and (
+              not attested or any(trust != "unsigned-self-host" for trust in attested.values())
+          ):
+              raise SystemExit("unsigned publication requires every Windows asset to be explicitly attested unsigned-self-host")
+          if not publish_unsigned and "unsigned-self-host" in attested.values():
+              raise SystemExit("unsigned self-host attestation reached a run without explicit opt-in")
 
           official = json.loads(Path(os.environ["OFFICIAL_MANIFEST_PATH"]).read_text())
           official_trust = {
@@ -1140,6 +1177,8 @@ jobs:
                   # it must never describe unsigned bytes as signed.
                   if trust == "unsigned-dry-run":
                       trust = "none"
+                  if trust == "unsigned-self-host":
+                      trust = "none"
               else:
                   trust = official_trust.get(name)
                   if trust is None:
@@ -1147,12 +1186,15 @@ jobs:
                           f"mirrored asset {name} has no platformTrust in the verified "
                           "official manifest — refusing to invent one"
                       )
-              assets.append({
+              asset = {
                   "name": name,
                   "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                   "size": path.stat().st_size,
                   "platformTrust": trust,
-              })
+              }
+              if publish_unsigned and name in attested:
+                  asset["edition"] = "self-host"
+              assets.append(asset)
 
           manifest = {
               "schemaVersion": 1,
@@ -1174,9 +1216,9 @@ jobs:
 
       - name: Sign release artifact manifest (your Ed25519 key)
         env:
-          # Deliberately empty on a dry run: the real key must never reach the
-          # runner for a run that produces unsigned binaries. See the ephemeral
-          # branch below for why.
+          # Dry runs use a throwaway key. An explicitly requested unsigned
+          # self-host prerelease is separately labeled and uses the real key
+          # so the deployment can verify its provenance and checksums.
           RELEASE_MANIFEST_ED25519_PRIVATE_KEY: ${{ inputs.dry-run == false && secrets.RELEASE_MANIFEST_ED25519_PRIVATE_KEY || '' }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: |
@@ -1195,12 +1237,8 @@ jobs:
 
           let privateKey;
           if (dryRun) {
-            // Branch on dry-run, NOT on the secret being absent. A dry run skips
-            // every signing step, so the manifest it produces describes unsigned
-            // binaries. Signing that with the real key would mint a genuine
-            // attestation over unsigned bytes and leave it in a downloadable
-            // artifact — a signing oracle. The ephemeral key makes the dry-run
-            // bundle cryptographically worthless, which is the point.
+            // A dry run never publishes. Its unsigned outputs are signed with
+            // a throwaway key so they cannot be mistaken for a release.
             ({ privateKey } = generateKeyPairSync('ed25519'));
             console.log('dry-run: signing with an ephemeral throwaway key (your real key is never used on a dry run)');
           } else {
@@ -1304,6 +1342,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.validate.outputs.version }}
           CLOUDCOM_SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit }}
+          PUBLISH_UNSIGNED: ${{ inputs.publish-unsigned }}
         run: |
           set -euo pipefail
           # Re-check immediately before create: a concurrent run may have
@@ -1325,7 +1364,12 @@ jobs:
               exit 1
               ;;
           esac
-          if [ -n "$CLOUDCOM_SOURCE_COMMIT" ]; then
+          release_flags=()
+          if [ "$PUBLISH_UNSIGNED" = true ]; then
+            title="CloudCom ${VERSION} (UNSIGNED Windows self-host test)"
+            notes="UNSIGNED Windows-only CloudCom test build from osvendor/cloudcom commit ${CLOUDCOM_SOURCE_COMMIT}. The Ed25519 manifest signs provenance/checksums, but EXEs and MSI have no Authenticode signature. This prerelease is not a fleet update; do not repoint all-platform Breeze downloads at it."
+            release_flags+=(--prerelease)
+          elif [ -n "$CLOUDCOM_SOURCE_COMMIT" ]; then
             title="CloudCom ${VERSION} (Windows self-host)"
             notes="Windows-only CloudCom agent packages built from osvendor/cloudcom commit ${CLOUDCOM_SOURCE_COMMIT} and signed with this organization's certificates. Do not point all-platform Breeze binary downloads at this partial release."
           else
@@ -1333,13 +1377,15 @@ jobs:
             notes="Breeze ${VERSION} agent packages signed with this organization's certificates. Built from official unsigned artifacts of https://github.com/lanternops/breeze/releases/tag/v${VERSION}, verified against the official Ed25519 release manifest before signing."
           fi
           gh release create "v${VERSION}" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" --title "$title" --notes "$notes"
+            --repo "$GITHUB_REPOSITORY" --title "$title" --notes "$notes" \
+            "${release_flags[@]}"
 
       - name: Write instance configuration summary
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           DRY_RUN: ${{ inputs.dry-run }}
           CLOUDCOM_SOURCE_COMMIT: ${{ inputs.cloudcom-source-commit }}
+          PUBLISH_UNSIGNED: ${{ inputs.publish-unsigned }}
         run: |
           set -euo pipefail
           pubkey="$(cat derived-public-key.txt)"
@@ -1356,6 +1402,9 @@ jobs:
             fi
             if [ -n "$CLOUDCOM_SOURCE_COMMIT" ]; then
               echo "> **Windows-only CloudCom release.** Keep the production BINARY_GITHUB_REPOSITORY and fleet promotion unchanged until a platform-scoped download source and signed canary rollout are verified. This workflow does not publish Linux/macOS agents."
+              if [ "$PUBLISH_UNSIGNED" = true ]; then
+                echo "> **UNSIGNED TEST BUILD.** The EXEs and MSI have no Authenticode signature. The Ed25519 manifest verifies source and checksums only."
+              fi
               echo ""
             else
             echo '```bash'
