@@ -1343,7 +1343,11 @@ jobs:
           set -euo pipefail
           pubkey="$(cat derived-public-key.txt)"
           {
-            echo "## Point your Breeze instance at this release"
+            if [ -n "$CLOUDCOM_SOURCE_COMMIT" ]; then
+              echo "## CloudCom Windows release result"
+            else
+              echo "## Point your Breeze instance at this release"
+            fi
             echo ""
             if [ "$DRY_RUN" = "true" ]; then
               echo "> **Dry run** — nothing was published. The binaries produced are **unsigned** and the key below is a throwaway generated in this run: your real manifest key was never loaded, so the \`dry-run-unsigned-assets\` artifact cannot be used as a release. Real runs print your real key here."
