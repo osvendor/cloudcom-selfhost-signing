@@ -90,6 +90,17 @@ Breeze has a platform-scoped source: Linux/macOS downloads would otherwise
 point at a release with no corresponding agents. Keep the OS-TEST canary
 isolated until that rollout path and a signed Windows install are verified.
 
+If a Windows certificate is unavailable and the owner explicitly accepts an
+unsigned test package, set `publish-unsigned: true` with `dry-run: false` for a
+CloudCom Windows-only build. The workflow skips Authenticode, labels each
+Windows asset `edition: self-host` and `platformTrust: none`, signs the release
+manifest with this repository's separate Ed25519 key, and publishes a clearly
+named **prerelease**. The manifest proves provenance and checksums; it does not
+make Windows show a trusted publisher. Never use this setting for an ordinary
+official release or for a hosted-edition asset. Keep production's all-platform
+source and fleet promotion unchanged. The `signing` environment still requires
+review before the build and release jobs run.
+
 ## Workflow inputs
 
 | Input | Values | Notes |
@@ -100,6 +111,7 @@ isolated until that rollout path and a signed Windows install are verified.
 | `signing-mode` | `azure-artifact-signing` (default), `pfx` | PFX is **legacy / internal-PKI only** — publicly trusted code-signing keys must live in HSMs (CA/B Forum, June 2023), so exportable PFX files are generally unavailable for new OV certs. |
 | `platforms` | `all` (default), `windows`, `macos` | Skip a platform **only if your fleet has no such devices** — a skipped platform's assets are absent from your release and those downloads will 404. A partial run also **consumes the version**: the release now exists, so a later run for the same version is refused and you would have to delete the release in the GitHub UI to add the other platform. |
 | `dry-run` | `false` (default), `true` | Download + verify + build with signing stubbed; no secrets or certs needed. Publishes nothing — assets land as the `dry-run-unsigned-assets` workflow artifact. Your manifest key is **never** used: the manifest is signed with a throwaway key generated in-run, and every asset is recorded `platformTrust: none`, so a dry-run bundle cannot be mistaken for a release. |
+| `publish-unsigned` | `false` (default), `true` | Explicit CloudCom Windows-only unsigned self-host prerelease; requires `dry-run: false`, a reviewed `signing` environment, and the real manifest signing key. Never implies Authenticode. |
 
 ## Secrets
 
