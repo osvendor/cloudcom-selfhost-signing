@@ -1,0 +1,181 @@
+name: Publish prebuilt CloudCom Windows release
+
+# Windows binaries are built and tested on OS-TEST. This workflow only checks
+# their hashes/provenance, signs the release manifest, and publishes the draft.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Numeric CloudCom agent version, without v
+        required: true
+        type: string
+      source-commit:
+        description: Exact tested CloudCom source commit
+        required: true
+        type: string
+      upstream-version:
+        description: Verified LanternOps baseline version, without v
+        required: true
+        type: string
+
+concurrency:
+  group: publish-prebuilt-windows-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify OS-TEST assets and publish
+    runs-on: ubuntu-latest
+    environment: signing
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      SOURCE_COMMIT: ${{ inputs.source-commit }}
+      UPSTREAM_VERSION: ${{ inputs.upstream-version }}
+    steps:
+      - name: Checkout release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify official upstream release manifest
+        id: upstream
+        uses: ./.github/actions/verify-official-release
+        with:
+          version: ${{ inputs.upstream-version }}
+
+      - name: Checkout exact CloudCom source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: osvendor/cloudcom
+          ref: ${{ inputs.source-commit }}
+          path: cloudcom
+          persist-credentials: false
+
+      - name: Verify source and unpublished draft
+        env:
+          VERIFIED_UPSTREAM_COMMIT: ${{ steps.upstream.outputs.source-commit }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::version must be numeric X.Y.Z'; exit 1; }
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::source commit must be exact lowercase SHA'; exit 1; }
+          [[ "$UPSTREAM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::upstream version must be numeric X.Y.Z'; exit 1; }
+          python3 - <<'PY'
+          import os
+          v = tuple(map(int, os.environ['VERSION'].split('.')))
+          upstream = tuple(map(int, os.environ['UPSTREAM_VERSION'].split('.')))
+          if v <= upstream or v[:2] != upstream[:2]:
+              raise SystemExit('CloudCom version must be above the same upstream minor line')
+          PY
+          test "$(git -C cloudcom rev-parse HEAD)" = "$SOURCE_COMMIT"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const b = JSON.parse(fs.readFileSync('cloudcom/.github/cloudcom-baseline.json'));
+          if (b.repository.toLowerCase() !== 'lanternops/breeze' ||
+              b.tag !== `v${process.env.UPSTREAM_VERSION}` ||
+              b.commit !== process.env.VERIFIED_UPSTREAM_COMMIT) {
+            throw new Error('CloudCom baseline differs from the verified official release');
+          }
+          NODE
+          comparison="$(gh api "repos/osvendor/cloudcom/compare/${SOURCE_COMMIT}...main" --jq .status)"
+          [[ "$comparison" == ahead || "$comparison" == identical ]] || { echo '::error::source is not on CloudCom main'; exit 1; }
+          passed="$(gh api "repos/osvendor/cloudcom/actions/workflows/cloudcom-ci.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&per_page=20" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+          [[ "$passed" -gt 0 ]] || { echo '::error::source has no passing push CI'; exit 1; }
+          gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '.isDraft and .isPrerelease' | grep -qx true
+
+      - name: Download staged OS-TEST build
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" --dir staged
+          gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json assets > staged/github-assets.json
+
+      - name: Verify exact staged asset set and hashes
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('staged')
+          build = json.loads((root / 'build-manifest.json').read_text())
+          expected = {
+              'breeze-agent.msi',
+              'breeze-agent-windows-amd64.exe',
+              'breeze-backup-windows-amd64.exe',
+              'breeze-watchdog-windows-amd64.exe',
+              'breeze-user-helper-windows-amd64.exe',
+          }
+          if build['Version'] != os.environ['VERSION'] or build['SourceCommit'] != os.environ['SOURCE_COMMIT'] or build['UpstreamTag'] != 'v' + os.environ['UPSTREAM_VERSION'] or build['Edition'] != 'SelfHost':
+              raise SystemExit('OS-TEST build identity does not match requested release')
+          assets = build['Assets']
+          if {a['Name'] for a in assets} != expected or len(assets) != len(expected):
+              raise SystemExit('OS-TEST asset inventory is incomplete or duplicated')
+          if {p.name for p in root.iterdir()} != expected | {'build-manifest.json', 'github-assets.json'}:
+              raise SystemExit('draft has unexpected or missing assets')
+          remote = {a['name']: a for a in json.loads((root / 'github-assets.json').read_text())['assets']}
+          if set(remote) != expected | {'build-manifest.json'}:
+              raise SystemExit('draft release has unexpected or missing remote assets')
+          release_assets = []
+          for a in assets:
+              path = root / a['Name']
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != a['Sha256'].lower() or path.stat().st_size != a['Size']:
+                  raise SystemExit(f"asset hash/size mismatch: {a['Name']}")
+              if remote[a['Name']]['digest'] != 'sha256:' + digest or remote[a['Name']]['size'] != a['Size']:
+                  raise SystemExit(f"remote asset changed during verification: {a['Name']}")
+              release_assets.append({'name': a['Name'], 'sha256': digest, 'size': a['Size'], 'edition': 'self-host', 'platformTrust': 'none'})
+          manifest = {'schemaVersion': 1, 'repository': os.environ['GITHUB_REPOSITORY'], 'release': 'v' + os.environ['VERSION'], 'sourceCommit': os.environ['SOURCE_COMMIT'], 'assets': sorted(release_assets, key=lambda a: a['name'])}
+          (root / 'release-artifact-manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          (root / 'checksums.txt').write_text(''.join(f"{a['sha256']}  {a['name']}\n" for a in manifest['assets']))
+          print(f"Verified {len(assets)} OS-TEST assets")
+          PY
+
+      - name: Sign manifest with protected release key
+        env:
+          RELEASE_MANIFEST_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_MANIFEST_ED25519_PRIVATE_KEY }}
+        run: |
+          node - <<'NODE'
+          const { createPrivateKey, createPublicKey, sign, verify } = require('node:crypto');
+          const fs = require('node:fs');
+          const raw = (process.env.RELEASE_MANIFEST_ED25519_PRIVATE_KEY || '').trim();
+          if (!raw) throw new Error('protected manifest-signing key is absent');
+          const key = raw.includes('BEGIN PRIVATE KEY') ? createPrivateKey(raw) : createPrivateKey({ key: Buffer.from(raw, 'base64'), format: 'der', type: 'pkcs8' });
+          const pub = createPublicKey(key);
+          const actual = pub.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
+          const expected = 'ci1EYhXkmjE2iDXHFFSUJM3lw0E+ljq2YwZQP2QOaNg=';
+          if (actual !== expected) throw new Error('release key does not match deployed trust root');
+          const payload = fs.readFileSync('staged/release-artifact-manifest.json');
+          const signature = sign(null, payload, key);
+          if (!verify(null, payload, pub, signature)) throw new Error('manifest signature self-check failed');
+          fs.writeFileSync('staged/release-artifact-manifest.json.ed25519', signature.toString('base64') + '\n');
+          NODE
+
+      - name: Publish verified draft
+        run: |
+          set -euo pipefail
+          # A run may be retried only while still a draft. Existing manifest
+          # assets are never overwritten; a half-published draft is reviewed.
+          names="$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")')"
+          for name in release-artifact-manifest.json release-artifact-manifest.json.ed25519 checksums.txt; do
+            [[ " $names " != *" $name "* ]] || { echo "::error::draft already contains $name"; exit 1; }
+          done
+          gh release upload "v${VERSION}" staged/release-artifact-manifest.json staged/release-artifact-manifest.json.ed25519 staged/checksums.txt --repo "$GITHUB_REPOSITORY"
+          gh release delete-asset "v${VERSION}" build-manifest.json --repo "$GITHUB_REPOSITORY" --yes
+          gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json assets > staged/final-github-assets.json
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root = Path('staged')
+          names = {a['name']: a for a in json.loads((root / 'final-github-assets.json').read_text())['assets']}
+          expected = {a['name'] for a in json.loads((root / 'release-artifact-manifest.json').read_text())['assets']}
+          expected |= {'release-artifact-manifest.json', 'release-artifact-manifest.json.ed25519', 'checksums.txt'}
+          if set(names) != expected:
+              raise SystemExit('final release asset set differs from the signed inventory')
+          for name in expected:
+              path = root / name
+              if names[name]['digest'] != 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest() or names[name]['size'] != path.stat().st_size:
+                  raise SystemExit(f'remote asset changed before publication: {name}')
+          PY
+          gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --title "CloudCom ${VERSION} (OS-TEST Windows self-host build)" --notes "Unsigned Windows-only self-host build from tested OS-TEST assets at CloudCom commit ${SOURCE_COMMIT}. The Ed25519 manifest authenticates provenance and hashes; EXEs and MSI have no Authenticode signature."
+          gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json isDraft,assets --jq '{isDraft,assets:[.assets[].name]}'
