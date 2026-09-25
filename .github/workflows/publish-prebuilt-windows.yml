@@ -98,7 +98,8 @@ jobs:
           import hashlib, json, os
           from pathlib import Path
           root = Path('staged')
-          build = json.loads((root / 'build-manifest.json').read_text())
+          # Windows PowerShell's UTF8 output includes a BOM on this build VM.
+          build = json.loads((root / 'build-manifest.json').read_text(encoding='utf-8-sig'))
           expected = {
               'breeze-agent.msi',
               'breeze-agent-windows-amd64.exe',
